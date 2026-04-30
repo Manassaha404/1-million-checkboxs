@@ -2,7 +2,6 @@ import {Server} from "socket.io"
 
 const io = new Server()
 import { publisher, subscriber, redisState } from "./app/common/configs/redis.js";
-import { raw } from "express";
 
 await subscriber.subscribe("redis:client:checkbox:event")
 subscriber.on('message', async (channel, message) => {

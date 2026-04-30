@@ -46,7 +46,7 @@ app.get(
 );
 
 app.use((_req, _res, next) => {
-  next(ApiError.notFound("Route not found"));
+  throw ApiError.notFound("Route not found");
 });
 
 app.use(errorHandler);
