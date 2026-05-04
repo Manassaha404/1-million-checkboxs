@@ -2,7 +2,14 @@ const CLIENT_ID = "2abdaf3d1ffba3b2d37bb8f9c29c6237";
 const AUTH_URL = "http://localhost:8080";
 const API_URL = "http://localhost:8000/api/v1";
 
-//all localStorage operations here
+import {
+  Virtualizer,
+  observeElementRect,
+  observeElementOffset,
+  elementScroll,
+} from "https://esm.sh/@tanstack/virtual-core";
+
+//localstorage operations
 const store = {
   get: () => {
     try {
@@ -15,31 +22,42 @@ const store = {
   clear: () => localStorage.removeItem("tokens"),
 };
 
-// refresh token
-async function refreshTokens(refreshToken) {
+// generate fresh Tokens with refreshTokens
+async function refreshTokens(rt) {
   const res = await fetch(`${API_URL}/auth/refresh`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refreshToken }),
+    body: JSON.stringify({ refreshToken: rt }),
   });
   if (!res.ok) throw new Error("Refresh failed");
   const fresh = await res.json();
-
-  const tokens = fresh.data.data ?? fresh;
+  const tokens = fresh.data?.data ?? fresh;
   store.set(tokens);
   return tokens;
 }
 
-//ui features
+// <-----------------------------UI----------------------------------------->
+//show auth
 function showAuth() {
   document.getElementById("loading").style.display = "none";
   document.getElementById("auth-overlay").classList.add("visible");
 }
 
+//user information
 function showUser(info) {
   document.getElementById("user-name").textContent =
     `${info.given_name} ${info.family_name}`;
   document.getElementById("user-row").classList.add("visible");
+}
+
+function esc(s) {
+  return s.replace(
+    /[&<>"']/g,
+    (m) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[
+        m
+      ],
+  );
 }
 
 function toast(html) {
@@ -50,176 +68,226 @@ function toast(html) {
   rack.appendChild(el);
   setTimeout(() => {
     el.classList.add("out");
-    el.addEventListener("animationend", () => el.remove());
+    el.addEventListener("animationend", () => el.remove(), { once: true });
   }, 3000);
 }
 
-function esc(s) {
-  return String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-}
-
-// Login
-document.getElementById("login-btn").addEventListener("click", () => {
+document.getElementById("login-btn").onclick = () => {
   window.location.href = `${AUTH_URL}/login?clientId=${CLIENT_ID}`;
-});
-
-// Logout
-document.getElementById("logout-btn").addEventListener("click", () => {
+};
+document.getElementById("logout-btn").onclick = () => {
   store.clear();
-  window.location.reload();
-});
+  location.reload();
+};
 
-// main function
+// <-----------------------------------MAIN-------------------------------------->
 (async () => {
-  // get the code when we first time login
-  const params = new URLSearchParams(window.location.search);
-  const code = params.get("code");
-
-  // tokens from localStorage
+  //get code and tokens
+  const code = new URLSearchParams(location.search).get("code");
   let tokens = store.get();
-
-  // 1st case -> tokens not stored but login complete so code is there
+  //conditions
   if (!tokens && code) {
-    window.history.replaceState({}, "", window.location.pathname);
+    history.replaceState({}, "", location.pathname);
     try {
-      // call backend for token exchange: [code] -> [accessToken, refreshToken, id_token]
       const res = await fetch(`${API_URL}/auth/token`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code }),
       });
-      if (!res.ok) throw new Error();
       const body = await res.json();
       tokens = body.data.data;
-
-      // store tokens to localStorage
       store.set(tokens);
     } catch {
       showAuth();
       return;
     }
   }
+  if (!tokens) return showAuth();
 
-  // if tokens and code are both undefined, user should login
-  if (!tokens) {
-    showAuth();
-    return;
-  }
-
+  //set user info
   let userInfo;
   try {
-    // get userinfo by id_token
     let res = await fetch(`${API_URL}/auth/info`, {
       headers: { Authorization: `Bearer ${tokens.id_token}` },
     });
-
-    // if id_token expired, try refreshing tokens
     if (res.status === 401) {
-      const fresh = await refreshTokens(tokens.refreshToken);
-      tokens = fresh; // ✅ refreshTokens() already returns unwrapped tokens
-
+      tokens = await refreshTokens(tokens.refreshToken);
       res = await fetch(`${API_URL}/auth/info`, {
         headers: { Authorization: `Bearer ${tokens.id_token}` },
       });
     }
-
-    if (!res.ok) throw new Error(`Auth info failed: ${res.status}`);
-
     const body = await res.json();
     userInfo = body.data ?? body;
-  } catch (err) {
-    // if refreshToken also expires, user should log in
+  } catch {
     store.clear();
-    showAuth();
-    return;
+    return showAuth();
   }
 
-  // user info fetched successfully, show user name
   showUser(userInfo);
-
   const me = {
     id: userInfo.sub,
     name: `${userInfo.given_name} ${userInfo.family_name}`,
   };
 
-  let checkboxs;
+  // get checkboxs data
+  let checkboxes;
   try {
-    // fetching checkboxes with accessToken
-    let checkboxRes = await fetch(`${API_URL}/checkbox`, { 
+    let res = await fetch(`${API_URL}/checkbox`, {
       headers: { Authorization: `Bearer ${tokens.accessToken}` },
     });
-
-    // if accessToken expired, try refreshing tokens
-    if (checkboxRes.status === 401) {
-      const fresh = await refreshTokens(tokens.refreshToken);
-      tokens = fresh; 
-
-      checkboxRes = await fetch(`${API_URL}/checkbox`, { 
+    if (res.status === 401) {
+      tokens = await refreshTokens(tokens.refreshToken);
+      res = await fetch(`${API_URL}/checkbox`, {
         headers: { Authorization: `Bearer ${tokens.accessToken}` },
       });
     }
-
-    if (!checkboxRes.ok) throw new Error();
-    const rawData = await checkboxRes.json();
-    checkboxs = rawData.data;
-
+    checkboxes = (await res.json()).data;
   } catch {
-    document.getElementById("loading").textContent =
-      "failed to load. is the server running?";
+    document.getElementById("loading").textContent = "failed to load";
     return;
   }
 
+  const socket = io();
+
+  // get grid
   const grid = document.getElementById("grid");
-  const fragment = document.createDocumentFragment();
-  let checked = 0;
+  const loading = document.getElementById("loading");
+  const countEl = document.getElementById("count");
+  // <-----------------------------VIRTUAL SCROLLING------------------------------->
+  loading.style.display = "none";
+  grid.classList.add("ready");
 
-  const socket = io({ auth: { token: store.get()?.accessToken } });
+  const TOTAL = checkboxes.length;
+  const CB_SIZE = 20;
+  const CB_GAP = 8;
+  const PADDING = 32;
+  const ROW_HEIGHT = CB_SIZE + CB_GAP; // 28px
+  const COLS = Math.max(
+    1,
+    Math.floor((grid.clientWidth - PADDING + CB_GAP) / (CB_SIZE + CB_GAP)),
+  );
+  const ROWS = Math.ceil(TOTAL / COLS);
 
-  checkboxs.forEach((value, index) => {
-    // create checkboxes
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.id = `cb-${index}`;
-    cb.checked = value;
-    if (value) checked++;
+  let checked = checkboxes.filter(Boolean).length;
+  countEl.textContent = `checked: ${checked.toLocaleString()}`;
 
-    // emit event
-    cb.addEventListener("change", (e) => {
-      socket.emit("client:checkbox:event", {
-        isChecked: e.target.checked,
-        index,
-        userId: me.id,
-        displayName: me.name,
-      });
+  const inner = document.createElement("div");
+  inner.style.cssText = "position:relative;";
+  grid.appendChild(inner);
+
+  /* PERF: row map avoids querySelector on every render tick */
+  const rowMap = new Map(); // rowIndex → <div>
+
+  /* PERF: label map lets socket handler update DOM in O(1) */
+  const labelMap = new Map(); // checkbox index → <span>.cb-box
+
+  /* ---------------- VIRTUALIZER ---------------- */
+  const virt = new Virtualizer({
+    count: ROWS,
+    getScrollElement: () => grid,
+    estimateSize: () => ROW_HEIGHT,
+    overscan: 5, // back to 5 — 10 was overkill
+    observeElementRect,
+    observeElementOffset,
+    scrollToFn: elementScroll,
+    onChange: () => render(),
+  });
+  const cleanup = virt._didMount();
+
+  function render() {
+    const items = virt.getVirtualItems();
+    inner.style.height = virt.getTotalSize() + "px";
+    const visible = new Set(items.map((v) => v.index));
+    for (const [idx, el] of rowMap) {
+      if (!visible.has(idx)) {
+        for (const label of el.querySelectorAll(".cb-box")) {
+          labelMap.delete(Number(label.dataset.index));
+        }
+        inner.removeChild(el);
+        rowMap.delete(idx);
+      }
+    }
+
+   
+    for (const vr of items) {
+      let row = rowMap.get(vr.index);
+
+      if (!row) {
+        row = document.createElement("div");
+        row.style.cssText = `position:absolute;left:0;display:flex;gap:${CB_GAP}px;align-items:center;height:${ROW_HEIGHT}px;`;
+        const frag = document.createDocumentFragment();
+        for (let c = 0; c < COLS; c++) {
+          const i = vr.index * COLS + c;
+          if (i >= TOTAL) break;
+          const label = document.createElement("label");
+          label.className = "cb-wrap";
+
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.checked = checkboxes[i];
+          input.dataset.index = i;
+
+          const box = document.createElement("span");
+          box.className = "cb-box" + (checkboxes[i] ? " is-checked" : "");
+          box.dataset.index = i; // used by socket handler via labelMap
+
+          label.appendChild(input);
+          label.appendChild(box);
+          frag.appendChild(label);
+
+          labelMap.set(i, box); // O(1) lookup later
+        }
+        row.appendChild(frag);
+        inner.appendChild(row);
+        rowMap.set(vr.index, row);
+      }
+      row.style.top = vr.start + "px";
+    }
+  }
+
+  virt._willUpdate();
+  render();
+
+  /* ---------------- INTERACTION ---------------- */
+  inner.addEventListener("change", (e) => {
+    const input = e.target;
+    if (input.type !== "checkbox") return;
+
+    const i = Number(input.dataset.index);
+    const val = input.checked;
+
+    checkboxes[i] = val;
+    checked += val ? 1 : -1;
+    countEl.textContent = `checked: ${checked.toLocaleString()}`;
+
+    /* toggle class only — no reflow, no offsetWidth trick */
+    const box = input.nextElementSibling;
+    if (box) box.classList.toggle("is-checked", val);
+
+    socket.emit("client:checkbox:event", {
+      isChecked: val,
+      index: i,
+      userId: me.id,
+      displayName: me.name,
     });
-
-    // add to fragment
-    fragment.appendChild(cb);
   });
 
-  grid.appendChild(fragment);
-  document.getElementById("loading").style.display = "none";
-  grid.classList.add("ready");
-  document.getElementById("count").textContent =
-    `checked: ${checked.toLocaleString()}`;
-
-  // server socket response handler
+  //<-----------------------------Socket Logic-------------------------------->
   socket.on(
     "server:checkbox:event",
     ({ isChecked, index, userId, displayName }) => {
-      const cb = document.getElementById(`cb-${index}`);
-      if (!cb) return;
+      checkboxes[index] = isChecked;
+      checked += isChecked ? 1 : -1;
+      countEl.textContent = `checked: ${checked.toLocaleString()}`;
+      const box = labelMap.get(index);
+      if (box) {
+        box.classList.toggle("is-checked", isChecked);
+        if (userId !== me.id) {
+          box.classList.remove("remote-flash");
 
-      cb.checked = isChecked;
-      checked += isChecked ? 1 : -1; // handle total checked counter
-      document.getElementById("count").textContent =
-        `checked: ${checked.toLocaleString()}`;
-
-      // show realtime who clicked checkboxes
+          requestAnimationFrame(() => box.classList.add("remote-flash"));
+        }
+      }
       if (userId !== me.id) {
         toast(
           `<span class="name">${esc(displayName)}</span> ${isChecked ? "☑" : "☐"} #${index + 1}`,
@@ -227,4 +295,6 @@ document.getElementById("logout-btn").addEventListener("click", () => {
       }
     },
   );
+
+  window.addEventListener("beforeunload", cleanup);
 })();
